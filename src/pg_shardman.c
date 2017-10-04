@@ -260,6 +260,8 @@ shardlord_main(Datum main_arg)
 				add_node(cmd);
 			else if (strcmp(cmd->cmd_type, "rm_node") == 0)
 				rm_node(cmd);
+			else if (strcmp(cmd->cmd_type, "drop_partitioned_table") == 0)
+				drop_partitioned_table(cmd);
 			else if (strcmp(cmd->cmd_type, "create_hash_partitions") == 0)
 				create_hash_partitions(cmd);
 			else if (strcmp(cmd->cmd_type, "move_part") == 0)

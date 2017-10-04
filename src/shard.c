@@ -311,3 +311,30 @@ set_replevel(Cmd *cmd)
 			  replevel);
 	update_cmd_status(cmd->id, "success");
 }
+
+/*
+ * Completely remove partitioned table from all nodes.
+ */
+void
+drop_partitioned_table(Cmd *cmd)
+{
+	char   *table = cmd->opts[0],
+		   *sql;
+	uint64	res;
+
+	/* Triggers will automatically drop parent and its partitions */
+	sql = psprintf("delete from shardman.tables where relation = '%s'", table);
+	res = void_spi(sql);
+	pfree(sql);
+
+	if (res > 0)
+	{
+		shmn_elog(LOG, "Drop table %s: successfully done", table);
+		update_cmd_status(cmd->id, "done");
+	}
+	else
+	{
+		shmn_elog(LOG, "Drop table %s: failed, no such table", table);
+		update_cmd_status(cmd->id, "failed");
+	}
+}

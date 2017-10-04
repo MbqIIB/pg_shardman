@@ -31,13 +31,16 @@ CREATE TABLE cmd_log (
 
 	-- available commands
 	CONSTRAINT check_cmd_type
-	CHECK (cmd_type IN ('add_node', 'rm_node', 'create_hash_partitions',
-						 'move_part', 'create_replica', 'rebalance',
-						 'set_replevel')),
+	CHECK (cmd_type IN ('add_node', 'rm_node',
+						'drop_partitioned_table',
+						'create_hash_partitions',
+						'move_part', 'create_replica',
+						'rebalance', 'set_replevel')),
 
 	-- command status
 	CONSTRAINT check_cmd_status
-	CHECK (status IN ('waiting', 'canceled', 'failed', 'in progress',
+	CHECK (status IN ('waiting', 'canceled',
+					  'failed', 'in progress',
 					  'success', 'done'))
 );
 
@@ -98,6 +101,20 @@ BEGIN
 
 	-- return last command's id
 	RETURN cmd_id;
+END
+$$ LANGUAGE plpgsql;
+
+-- Remove partitioned table, its partitions and replicas from all nodes.
+CREATE FUNCTION drop_partitioned_table(relation text) RETURNS int AS $$
+DECLARE
+	cmd_id	int;
+	cmd		text;
+	opts	text[];
+BEGIN
+	cmd = 'drop_partitioned_table';
+	opts = ARRAY[relation::text];
+
+	RETURN @extschema@.register_cmd(cmd, opts);
 END
 $$ LANGUAGE plpgsql;
 

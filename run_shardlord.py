@@ -132,6 +132,8 @@ if __name__ == "__main__":
             select shardman.create_hash_partitions(2, 'pt', 'id', 4, true);
         """)
 
+        #lord.safe_psql(DBNAME, "select shardman.set_replevel('pt', 1)")
+
         print("%s:" % lord.name)
         print("\t-> port %i" % lord.port)
         print("\t-> dir  %s" % lord.base_dir)

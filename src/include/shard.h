@@ -16,5 +16,6 @@ extern void move_part(Cmd *cmd);
 extern void create_replica(Cmd *cmd);
 extern void rebalance(Cmd *cmd);
 extern void set_replevel(Cmd *cmd);
+extern void drop_partitioned_table(Cmd *cmd);
 
 #endif							/* SHARD_H */

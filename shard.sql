@@ -45,8 +45,7 @@ BEGIN
 					   partition_names);
 	END IF;
 	RETURN NULL;
-END
-$$ LANGUAGE plpgsql;
+END $$ LANGUAGE plpgsql;
 CREATE TRIGGER new_table_worker_side AFTER INSERT ON shardman.tables
 	FOR EACH ROW EXECUTE PROCEDURE new_table_worker_side();
 -- fire trigger only on worker nodes
@@ -61,10 +60,28 @@ BEGIN
 		  NEW.relation, NEW.partitions_count))
 			   AS partnames;
 	RETURN NULL;
-END
-$$ LANGUAGE plpgsql;
+END $$ LANGUAGE plpgsql;
 CREATE TRIGGER new_table_lord_side AFTER INSERT ON shardman.tables
 	FOR EACH ROW EXECUTE PROCEDURE new_table_lord_side();
+CREATE FUNCTION table_removed_lord_side() RETURNS TRIGGER AS $$
+BEGIN
+	-- this will drop all partitions and replicas on each worker node
+	DELETE FROM shardman.partitions WHERE relation = OLD.relation;
+	RETURN OLD;
+END $$ LANGUAGE plpgsql;
+CREATE TRIGGER table_removed_lord_side AFTER DELETE ON shardman.tables
+	FOR EACH ROW EXECUTE PROCEDURE table_removed_lord_side();
+CREATE FUNCTION table_removed_worker_side() RETURNS TRIGGER AS $$
+BEGIN
+	-- drop childless parent on all worker nodes
+	EXECUTE format('DROP TABLE IF EXISTS %I', OLD.relation);
+	RETURN OLD;
+END $$ LANGUAGE plpgsql;
+CREATE CONSTRAINT TRIGGER table_removed_worker_side AFTER DELETE ON shardman.tables
+	DEFERRABLE INITIALLY DEFERRED -- we'd like to call this trigger at xact's end
+	FOR EACH ROW EXECUTE PROCEDURE table_removed_worker_side();
+-- fire trigger only on worker nodes
+ALTER TABLE shardman.tables ENABLE REPLICA TRIGGER table_removed_worker_side;
 
 ------------------------------------------------------------
 -- Partitions
@@ -80,7 +97,8 @@ CREATE TABLE partitions (
 	owner int NOT NULL REFERENCES nodes(id), -- node on which partition lies
 	prv int REFERENCES nodes(id),
 	nxt int REFERENCES nodes(id),
-	relation text NOT NULL REFERENCES tables(relation),
+	relation text NOT NULL REFERENCES tables(relation)
+		DEFERRABLE INITIALLY DEFERRED, -- check integrity at xact's end
 	PRIMARY KEY (part_name, owner)
 );
 
@@ -101,8 +119,7 @@ BEGIN
 		PERFORM shardman.replace_usual_part_with_foreign(NEW);
 	END IF;
 	RETURN NULL;
-END
-$$ LANGUAGE plpgsql;
+END $$ LANGUAGE plpgsql;
 CREATE TRIGGER new_primary AFTER INSERT ON shardman.partitions
 	FOR EACH ROW WHEN (NEW.prv IS NULL) EXECUTE PROCEDURE new_primary();
 -- fire trigger only on worker nodes
@@ -242,8 +259,7 @@ BEGIN
 	-- And update fdw almost everywhere
 	PERFORM shardman.update_fdw_table_srv(NEW);
 	RETURN NULL;
-END
-$$ LANGUAGE plpgsql;
+END $$ LANGUAGE plpgsql;
 CREATE TRIGGER part_moved AFTER UPDATE ON shardman.partitions
 	FOR EACH ROW WHEN (OLD.owner != NEW.owner -- part is really moved
 					   AND OLD.part_name = NEW.part_name) -- sanity check
@@ -261,13 +277,12 @@ ALTER TABLE shardman.partitions ENABLE REPLICA TRIGGER part_moved;
 -- caller is responsible for tracking that.
 CREATE FUNCTION part_removed() RETURNS TRIGGER AS $$
 DECLARE
-	replica_removed bool := OLD.prv IS NOT NULL; -- replica or primary removed?
-	 -- if primary removed, is there replica that we will promote?
-	replica_exists bool := OLD.nxt IS NOT NULL;
-	prim_repl_lname text; -- channel between primary and replica
-	me int := shardman.my_id();
-	new_primary shardman.partitions;
-	drop_slot_delay int := 2; -- two seconds
+	replica_removed		bool := OLD.prv IS NOT NULL; -- replica or primary removed?
+	replica_exists		bool := OLD.nxt IS NOT NULL; -- this part has replica?
+	prim_repl_lname		text; -- channel between primary and replica
+	drop_slot_delay		int := 2; -- two seconds
+	new_primary			shardman.partitions; -- replica of this part (may be NULL)
+	me					int := shardman.my_id();
 BEGIN
 	RAISE DEBUG '[SHMN] part_removed trigger called for part %, owner %',
 		OLD.part_name, OLD.owner;
@@ -282,68 +297,81 @@ BEGIN
 		prim_repl_lname := shardman.get_data_lname(OLD.part_name, OLD.prv, OLD.owner);
 	ELSE -- Primary is removed
 		IF replica_exists THEN -- Primary removed, and it has replica
-			prim_repl_lname := shardman.get_data_lname(OLD.part_name, OLD.owner,
-													   OLD.nxt);
+			prim_repl_lname := shardman.get_data_lname(OLD.part_name, OLD.owner, OLD.nxt);
 			-- This replica is new primary
 			SELECT * FROM shardman.partitions
-			 WHERE owner = OLD.nxt AND part_name= OLD.part_name INTO new_primary;
-			-- whole record nullability seems to be non-working
-			ASSERT new_primary.part_name IS NOT NULL;
+				WHERE owner = OLD.nxt AND part_name = OLD.part_name INTO new_primary;
 		END IF;
 	END IF;
 
-	IF me = OLD.owner THEN -- part dropped on us
-		IF replica_removed THEN -- replica removed on us
+	-- node was owner of this part
+	IF me = OLD.owner THEN
+		-- this part WAS a replica
+		IF replica_removed THEN
 			PERFORM shardman.eliminate_sub(prim_repl_lname);
-		ELSE -- primary removed on us
-			IF replica_exists THEN
-				-- If next replica existed, drop pub & rs for data channel
- 				-- Wait sometime to let replica first remove subscription
-				PERFORM pg_sleep(drop_slot_delay);
-				PERFORM shardman.drop_repslot_and_pub(prim_repl_lname);
-				PERFORM shardman.remove_sync_standby(prim_repl_lname);
+		-- this part MIGHT HAVE a replica
+		ELSEIF replica_exists THEN
+			-- Wait sometime to let replica first remove subscription
+			PERFORM pg_sleep(drop_slot_delay);
+			-- Drop pub & rs for data channel
+			PERFORM shardman.drop_repslot_and_pub(prim_repl_lname);
+			-- Make replica's node asynchronous standby
+			PERFORM shardman.remove_sync_standby(prim_repl_lname);
+			-- perform some action if replica exists
+			IF new_primary IS NOT NULL THEN
 				-- replace removed table with foreign one on promoted replica
 				PERFORM shardman.replace_usual_part_with_foreign(new_primary);
 			END IF;
 		END IF;
 		-- Drop old table anyway
 		EXECUTE format('DROP TABLE IF EXISTS %I', OLD.part_name);
-	ELSEIF me = OLD.prv THEN -- node with primary for which replica was dropped
+	-- node with primary for which replica was dropped
+	ELSEIF me = OLD.prv THEN
 		-- Wait sometime to let other node first remove subscription
 		PERFORM pg_sleep(drop_slot_delay);
 		-- Drop pub & rs for data channel
 		PERFORM shardman.drop_repslot_and_pub(prim_repl_lname);
+		-- Make replica's node asynchronous standby
 		PERFORM shardman.remove_sync_standby(prim_repl_lname);
-	ELSEIF me = OLD.nxt THEN -- node with replica for which primary was dropped
+	-- node with replica for which primary was dropped
+	ELSEIF me = OLD.nxt THEN
 		-- Drop sub for data channel
 		PERFORM shardman.eliminate_sub(prim_repl_lname);
-	    -- This replica is promoted to primary node, so drop trigger disabling
-	    -- writes to the table and replace fdw with normal part
-		PERFORM shardman.readonly_replica_off(OLD.part_name);
-		-- Replace FDW with local partition
-	    PERFORM shardman.replace_foreign_part_with_usual(new_primary);
- 	END IF;
+		-- perform some action if replica exists
+		IF new_primary IS NOT NULL THEN
+			-- Enable writes to replica (it's going to become primary part)
+			PERFORM shardman.readonly_replica_off(OLD.part_name);
+			-- Replace foreign table with local partition
+			PERFORM shardman.replace_foreign_part_with_usual(new_primary);
+		END IF;
+	END IF;
 
-	IF NOT replica_removed AND shardman.me_worker() THEN
-	   -- update fdw almost everywhere
-	   PERFORM shardman.update_fdw_table_srv(new_primary);
+	IF shardman.me_worker() THEN
+		-- perform some action if replica exists
+		IF new_primary IS NOT NULL THEN
+			-- update fdw almost everywhere
+			PERFORM shardman.update_fdw_table_srv(new_primary);
+		-- drop stray foreign tables (partitions have been dropped)
+		ELSEIF OLD.prv IS NULL THEN -- don't repeat drop stmt N times
+			EXECUTE format('DROP FOREIGN TABLE IF EXISTS %I',
+						   shardman.get_fdw_part_name(OLD.part_name));
+		END IF;
 	END IF;
 
 	IF shardman.me_lord() THEN
 		-- update partitions table: promote replica immediately after primary
 		-- removal or remove link to dropped replica.
 		IF replica_removed THEN
-			UPDATE shardman.partitions SET nxt = NULL WHERE owner = OLD.prv AND
-			part_name = OLD.part_name;
+			UPDATE shardman.partitions SET nxt = NULL
+				WHERE owner = OLD.prv AND part_name = OLD.part_name;
 		ELSE
 			UPDATE shardman.partitions SET prv = NULL
-			 WHERE owner = OLD.nxt AND part_name = OLD.part_name;
+				WHERE owner = OLD.nxt AND part_name = OLD.part_name;
 		END IF;
 	END IF;
 
 	RETURN NULL;
-END
-$$ LANGUAGE plpgsql;
+END $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER part_removed AFTER DELETE ON shardman.partitions
 	FOR EACH ROW
@@ -540,8 +568,13 @@ BEGIN
 	  INTO server_oid;
 	SELECT oid FROM pg_class WHERE relname = shardman.get_fdw_part_name(part.part_name)
 	  INTO foreign_table_oid;
-	ASSERT foreign_table_oid IS NOT NULL, 'update_fdw_table_srv: table not found';
-	UPDATE pg_foreign_table SET ftserver = server_oid WHERE ftrelid = foreign_table_oid;
+
+	IF foreign_table_oid IS NOT NULL THEN
+		UPDATE pg_foreign_table SET ftserver = server_oid WHERE ftrelid = foreign_table_oid;
+	ELSE
+		RAISE DEBUG '[SHMN] update_fdw_table_srv: table not found';
+	END IF;
+
 END $$ LANGUAGE plpgsql STRICT;
 
 -- Replace existing hash partition with foreign, assuming 'partition' shows
@@ -746,7 +779,7 @@ BEGIN
 END $$ LANGUAGE plpgsql STRICT;
 
 CREATE FUNCTION gen_create_table_sql(relation text, connstring text) RETURNS text
-    AS 'pg_shardman' LANGUAGE C STRICT;
+	AS 'pg_shardman' LANGUAGE C STRICT;
 
 CREATE FUNCTION reconstruct_table_attrs(relation regclass)
 	RETURNS text AS 'pg_shardman' LANGUAGE C STRICT;
@@ -811,7 +844,7 @@ BEGIN
 	END IF;
 END $$ LANGUAGE plpgsql STRICT;
 CREATE FUNCTION ensure_sync_standby_c(standby text) RETURNS text
-    AS 'pg_shardman' LANGUAGE C STRICT;
+	AS 'pg_shardman' LANGUAGE C STRICT;
 
 -- Remove 'standby' from synchronous_standby_names, if it is there, and SIGHUP
 -- postmaster.
